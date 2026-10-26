@@ -1,0 +1,14 @@
+{
+  "dataset": "BE3",
+  "feature_set": "e3a",
+  "protocol": "E3 fixed 15% test and 5-fold stratified CV on remaining 85%",
+  "architecture": "Original E3 BioFusion; no added feature branch",
+  "objective": "BCE-Dice + ranking_weight * pairwise_softplus_same_sgRNA",
+  "ranking_weight": 0.1,
+  "batch_composition": "64 positive + 64 nearest same-guide negative pairs + 128 normal negatives",
+  "pair_negative_policy": "Sample among the 32 nearest same-guide training negatives by symmetric difference of position/base-substitution signatures",
+  "epochs": 35,
+  "steps_per_epoch": 120,
+  "checkpoint_rule": "minimum validation BCE-Dice loss, matching E3 checkpoint rule",
+  "test_used_for_selection": false
+}
