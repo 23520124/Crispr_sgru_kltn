@@ -1,0 +1,21 @@
+Environmental requirements：
+CUDA is necessary for training model in GPU： CUDA Version:11.8
+The Python packages should be installed :
+Keras 2.4.3
+tensorflow-gpu 2.5.0
+scikit-learn 0.24.2
+
+model_test
+This script (model_test.py) is designed to evaluate the performance of the machine learning model. It includes the following steps:
+1.Loading Model Weights: The pre-trained weights of the model will be loaded to ensure the model is ready for evaluation.
+2.Loading Datasets: The evaluation datasets are loaded to assess how the model performs on unseen data.
+3.Performance Evaluation: The models performance will be measured across six key metrics.
+
+Running：
+The file Running.py provides a running example, using the trained model to perform binary classification prediction on a single sample. Just click run to obtain the predicted result of the sample (on/off target).It is worth noting that this sample is one of the samples selected from the K562 dataset. If you need to predict different datasets and achieve better prediction results, you need to load different trained models.
+
+MODEL
+MODEL.py saves all the models in the paper experiment, including: Crispr_SGRU, Student_model, AttnToMismatch, CnnCrispr, CRISPR_Net, crispr_ip, CRISPR_M, Crispr_DNT.
+
+Encoding
+Encoder_sgRNA_off.py contains the encoding method of all models.
