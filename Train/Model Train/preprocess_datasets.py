@@ -3,6 +3,9 @@
 The output remains compatible with the existing loaders: three headerless
 columns containing sgRNA, off-target, and a binary label. Original files are
 never modified.
+
+Preserve duplicate observations. For a normalized (sgRNA, off-target) pair
+with both labels, keep every positive row and remove only its negative rows.
 """
 
 import argparse
@@ -240,49 +243,24 @@ def orientation_evidence(rows, selected_orientation):
     }
 
 
-def deduplicate(rows, conflict_policy):
-    report = inspect_duplicates(rows)
-    if report["conflict_pair_count"] and conflict_policy == "error":
-        return [], report
-
-    grouped = defaultdict(list)
-    for row in rows:
-        grouped[(row["sgrna"], row["offtarget"])].append(row)
-    output = []
-    for occurrences in grouped.values():
-        labels = {row["label"] for row in occurrences}
-        if len(labels) > 1 and conflict_policy == "keep":
-            output.extend(occurrences)
-            continue
-        if len(labels) > 1 and conflict_policy == "exclude":
-            continue
-        first = occurrences[0]
-        if len(labels) > 1 and conflict_policy == "positive":
-            first = {**first, "label": 1}
-        output.append(first)
-
-    report["output_rows"] = len(output)
-    report["duplicate_rows_removed"] = len(rows) - len(output)
-    report["conflict_policy"] = conflict_policy
-    return output, report
-
-
-def exclude_conflicting_pairs(rows, duplicate_report):
-    """Remove only mixed-label raw pairs; preserve same-label duplicates."""
+def resolve_label_conflicts(rows, duplicate_report):
+    """Drop negative rows of mixed-label pairs; preserve duplicates and order."""
     conflict_pairs = {
         tuple(item["pair"]) for item in duplicate_report["conflicts"]
     }
     output = [
         row for row in rows
-        if (row["sgrna"], row["offtarget"]) not in conflict_pairs
+        if row["label"] == 1
+        or (row["sgrna"], row["offtarget"]) not in conflict_pairs
     ]
     report = dict(duplicate_report)
     report["output_rows"] = len(output)
     report["duplicate_rows_removed"] = 0
     report["conflict_rows_removed"] = len(rows) - len(output)
-    report["conflict_policy"] = "exclude_conflicts_only"
+    report["conflict_policy"] = "keep_positive_rows"
+    report["duplicate_policy"] = "preserve_all"
     report["deduplication_applied"] = False
-    report["conflict_exclusion_applied"] = True
+    report["conflict_resolution_applied"] = True
     return output, report
 
 
@@ -327,58 +305,15 @@ def write_dataset(
     return output_csv, output_json
 
 
-def process_dataset(
-    dataset,
-    output_root,
-    orientation,
-    conflict_policy,
-    do_deduplicate,
-    exclude_conflicts_only,
-):
+def process_dataset(dataset, output_root, orientation):
     source = DATASET_PATHS[dataset]
     if not source.exists():
         raise FileNotFoundError(f"Dataset not found: {source}")
     rows, resolved_orientation, skipped, lengths = read_rows(
         source, dataset, orientation
     )
-    selected_schema_stats = schema_stats(rows)
     duplicate_report = inspect_duplicates(rows)
-    if (
-        duplicate_report["conflict_pair_count"]
-        and conflict_policy == "error"
-        and not exclude_conflicts_only
-    ):
-        audit_root = output_root / "audit"
-        audit_root.mkdir(parents=True, exist_ok=True)
-        audit = {
-            "dataset": dataset,
-            "source_file": str(source),
-            "source_sha256": sha256_file(source),
-            "sequence_column_order": resolved_orientation,
-            "rows_skipped": dict(skipped),
-            "input_sequence_lengths": dict(lengths),
-            "schema_stats": selected_schema_stats,
-            "orientation_evidence": orientation_evidence(
-                rows, resolved_orientation
-            ),
-            "deduplication": duplicate_report,
-        }
-        audit_path = audit_root / f"{dataset}.json"
-        audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
-        raise ValueError(
-            f"{dataset}: {duplicate_report['conflict_pair_count']} conflicting raw pairs; "
-            f"audit saved to {audit_path}. Use --deduplicate with an explicit "
-            "--conflict-policy to resolve them, or --exclude-conflicts-only."
-        )
-    cleaned = rows
-    report = duplicate_report
-    if exclude_conflicts_only:
-        cleaned, report = exclude_conflicting_pairs(rows, duplicate_report)
-    elif do_deduplicate:
-        cleaned, report = deduplicate(rows, conflict_policy)
-    else:
-        report["deduplication_applied"] = False
-        report["conflict_exclusion_applied"] = False
+    cleaned, report = resolve_label_conflicts(rows, duplicate_report)
 
     output_csv, output_json = write_dataset(
         dataset,
@@ -392,6 +327,7 @@ def process_dataset(
     )
     print(
         f"[{dataset}] {len(rows)} valid rows -> {len(cleaned)} output rows; "
+        f"negative conflict rows removed={report['conflict_rows_removed']}; "
         f"orientation={resolved_orientation}; output={output_csv}"
     )
     return output_csv, output_json
@@ -410,25 +346,7 @@ def main():
         "--orientation", choices=["manifest", "raw", "swap"], default="manifest",
         help="Use repository schema mapping, or force raw/swap column order.",
     )
-    parser.add_argument(
-        "--conflict-policy",
-        choices=["keep", "error", "exclude", "positive"],
-        default="keep",
-        help="How to handle identical pairs with contradictory labels.",
-    )
-    parser.add_argument(
-        "--deduplicate",
-        action="store_true",
-        help="Explicitly remove repeated sequence pairs; observations are preserved by default.",
-    )
-    parser.add_argument(
-        "--exclude-conflicts-only",
-        action="store_true",
-        help="Remove only raw pairs with mixed labels; preserve same-label duplicates.",
-    )
     args = parser.parse_args()
-    if args.deduplicate and args.exclude_conflicts_only:
-        parser.error("--deduplicate and --exclude-conflicts-only are mutually exclusive")
 
     datasets = sorted(DATASET_PATHS) if args.dataset == "all" else [args.dataset]
     failures = []
@@ -438,9 +356,6 @@ def main():
                 dataset,
                 args.output_root,
                 args.orientation,
-                args.conflict_policy,
-                args.deduplicate,
-                args.exclude_conflicts_only,
             )
         except Exception as exc:
             failures.append(f"{dataset}: {exc}")
