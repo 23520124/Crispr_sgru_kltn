@@ -1,26 +1,9 @@
-"""
-E3 — Biological Feature Fusion Experiment
+"""E3 BioFusion with the K562 20261030_213631 training configuration.
 
-Train P12 + unified biological features (BioFusion only).
-
-Feature set:
-- enhanced: unified mismatch, substitution, PAM, GC and positional indel features
-
-Mục tiêu:
-- Kiểm tra biological features có cải thiện PRAUC/F1 trên II5/II6
-- Giữ hiệu suất trên K562/HEK/BE3
-- So sánh công bằng: cùng split, seed, sampling, epochs, checkpoint rule
-
-Không thay đổi:
-- MODEL12/P12 backbone and five-fold split protocol
-- Weighted BCE-Dice loss (alpha=0.7, beta=2.0)
-- BioFusionGenerator (64 pos, 16 hard, 176 normal)
-- Batch size 256, 250 steps/epoch, epochs 35
-- Position-wise biological channels fused before BiGRU-2
-- Adam 1e-4, ReduceLROnPlateau
-- Checkpoint theo minimum val_loss
-- F1 threshold cumulative (E0), PRAUC from continuous probabilities
-- Kết quả: Mean ± Std của 5 fold (std ddof=0)
+Five independent folds on the 85% development pool select checkpoints by
+minimum val_loss. Pool their held-out Validation predictions to lock one
+max-F1 threshold, then average the five checkpoint probabilities on the shared
+15% Test. No Test inference or Test metrics run during cross-validation.
 """
 
 import os
@@ -111,15 +94,9 @@ def encoding(data):
 
 
 def count_mismatches(seq1, seq2):
-    """Count aligned protospacer mismatches, excluding the terminal PAM."""
-    proto1 = str(seq1).strip().upper()[:-3]
-    proto2 = str(seq2).strip().upper()[:-3]
-    width = max(len(proto1), len(proto2))
-    if width > 21:
-        raise ValueError("Expected at most 21 aligned protospacer columns before NGG PAM")
-    proto1 = "-" * (width - len(proto1)) + proto1
-    proto2 = "-" * (width - len(proto2)) + proto2
-    return sum(1 for a, b in zip(proto1, proto2) if a != b)
+    """Legacy hard-pool rule used by the reference run: first 20 columns."""
+    limit = min(20, len(seq1), len(seq2))
+    return sum(a != b for a, b in zip(seq1[:limit], seq2[:limit]))
 
 
 def compute_file_hash(file_path):
@@ -146,6 +123,12 @@ def get_model_weights_hash(model):
 
 def find_optimal_f1_threshold(y_true, y_probs):
     """Select the F1-optimal probability threshold on validation only."""
+    y_true = np.asarray(y_true, dtype=np.int32)
+    y_probs = np.asarray(y_probs, dtype=np.float64)
+    if y_true.ndim != 1 or y_probs.shape != y_true.shape or not len(y_true):
+        raise ValueError("Expected nonempty, equally sized label and probability vectors")
+    if not np.isin(y_true, [0, 1]).all() or not np.isfinite(y_probs).all():
+        raise ValueError("Expected binary labels and finite probabilities")
     order = np.argsort(y_probs)
     probs = y_probs[order]
     labels = y_true[order]
@@ -156,11 +139,8 @@ def find_optimal_f1_threshold(y_true, y_probs):
     candidates = []
 
     def f1(tp, fp, fn):
-        if tp + fp == 0 or tp + fn == 0:
-            return 0.0
-        precision = tp / (tp + fp)
-        recall = tp / (tp + fn)
-        return 2 * precision * recall / (precision + recall)
+        denominator = 2 * tp + fp + fn
+        return 2 * tp / denominator if denominator else 0.0
 
     for i, threshold in enumerate(unique_probs):
         idx = first_indices[i]
@@ -185,7 +165,9 @@ class BioFusionGenerator:
     def __init__(self, pos_enc, pos_bio, pos_position,
                  bio_hard_enc, bio_hard_bio, bio_hard_position,
                  normal_enc, normal_bio, normal_position,
-                 batch_size=256, steps_per_epoch=120, seed=42):
+                 batch_size=256, steps_per_epoch=250, seed=42):
+        if batch_size != 256:
+            raise ValueError("Reference sampler requires batch_size=256 (64/16/176)")
         self.pos_enc = pos_enc
         self.pos_bio = pos_bio
         self.pos_position = pos_position
@@ -234,7 +216,87 @@ class BioFusionGenerator:
 # =========================================================================
 # MAIN
 # =========================================================================
-if __name__ == "__main__":
+def compute_metrics(y_true, probabilities, threshold):
+    """Score locked predictions; never select a threshold here."""
+    predicted = (probabilities >= threshold).astype(int)
+    metrics = {}
+    if len(np.unique(y_true)) == 2:
+        fpr, tpr, _ = roc_curve(y_true, probabilities)
+        metrics['AUROC'] = float(auc(fpr, tpr))
+        precision, recall, _ = precision_recall_curve(y_true, probabilities)
+        metrics['PRAUC'] = float(auc(recall, precision))
+    else:
+        metrics.update(AUROC=float('nan'), PRAUC=float('nan'))
+    metrics.update(
+        F1=float(f1_score(y_true, predicted, zero_division=0)),
+        Precision=float(precision_score(y_true, predicted, zero_division=0)),
+        Recall=float(recall_score(y_true, predicted, zero_division=0)),
+        MCC=float(matthews_corrcoef(y_true, predicted)),
+    )
+    for name, true_label, predicted_label in [('TP',1,1),('FN',1,0),('FP',0,1),('TN',0,0)]:
+        metrics[name] = int(np.sum((y_true == true_label) & (predicted == predicted_label)))
+    return metrics
+
+
+def predict_ensemble(fold_artifacts, sequence, raw_bio, position, learning_rate=1e-4):
+    """Average five checkpoint probabilities, each using its own Train scaler.
+
+    Test labels are absent. Call after CV and OOF threshold selection finish.
+    """
+    if len(fold_artifacts) != 5:
+        raise ValueError("Ensemble requires all five fold checkpoints")
+    for artifact in fold_artifacts:
+        for key in ('weights_path', 'scaler_path'):
+            if not os.path.isfile(artifact[key]):
+                raise FileNotFoundError(artifact[key])
+    probability_sum = np.zeros(len(sequence), dtype=np.float64)
+    for fold_number, artifact in enumerate(fold_artifacts, start=1):
+        with open(artifact['scaler_path'], encoding='utf-8') as handle:
+            stats = json.load(handle)
+        scaler = StandardScaler()
+        scaler.mean_ = np.asarray(stats['mean'], dtype=np.float64)
+        scaler.scale_ = np.asarray(stats['std'], dtype=np.float64)
+        scaler.n_features_in_ = len(scaler.mean_)
+        if (scaler.mean_.shape != (raw_bio.shape[1],)
+                or scaler.scale_.shape != scaler.mean_.shape
+                or not np.isfinite(scaler.mean_).all()
+                or not np.isfinite(scaler.scale_).all()
+                or np.any(scaler.scale_ <= 0)):
+            raise ValueError(f"Invalid Train scaler for fold {fold_number}")
+        scaled_bio = scaler.transform(raw_bio)
+        K.clear_session()
+        model = Crispr_SGRU_BioFusion(
+            bio_feature_dim=raw_bio.shape[1], position_feature_dim=position.shape[2],
+            learning_rate=learning_rate,
+        )
+        try:
+            model.load_weights(artifact['weights_path'])
+            output = model.predict((sequence, scaled_bio, position), verbose=0)
+            probabilities = positive_probability(output)
+            if probabilities.shape != probability_sum.shape or not np.isfinite(probabilities).all():
+                raise RuntimeError(f"Invalid ensemble probabilities for fold {fold_number}")
+            probability_sum += probabilities
+        finally:
+            del model, scaled_bio
+            K.clear_session()
+            gc.collect()
+    return probability_sum / len(fold_artifacts)
+
+
+def main(argv=None):
+    training_profile_path = os.path.join(CURRENT_DIR, "biofusion_training_profile.json")
+    with open(training_profile_path, encoding="utf-8") as handle:
+        training_profile = json.load(handle)
+    if training_profile["selection_rule"] != "val_loss_f1":
+        raise ValueError("Reference training profile must use val_loss_f1")
+    if training_profile["split_protocol"] != "classwise_holdout_stratified_fivefold":
+        raise ValueError("Reference training profile must use the original row-level split")
+    if (training_profile["hard_negative_mode"] != "static"
+            or training_profile["hard_negative_per_batch"] != 16):
+        raise ValueError("Reference sampler requires static hard negatives with quota 16")
+    validation_batch_size = int(training_profile["validation_batch_size"])
+    if validation_batch_size < 1:
+        raise ValueError("Validation batch size must be positive")
     parser = argparse.ArgumentParser(
         description="E3 BioFusion-only training using preprocessed datasets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -267,25 +329,29 @@ Datasets:
         help="Unified biological feature set (default: enhanced)"
     )
 
-    args = parser.parse_args()
+    parser.add_argument("--csv", default=None, help="Optional input CSV override")
+    parser.add_argument("--split-seed", type=int, default=training_profile["split_seed"])
+    parser.add_argument("--train-seed", type=int, default=training_profile["train_seed"])
+    parser.add_argument("--epochs", type=int, default=training_profile["epochs"])
+    parser.add_argument("--steps-per-epoch", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=training_profile["learning_rate"])
+    args = parser.parse_args(argv)
+    canonical_name = "HEK293t" if args.dataset == "hek" else args.dataset
+    if args.steps_per_epoch is None:
+        args.steps_per_epoch = training_profile["steps_per_epoch"][canonical_name]
+    if args.epochs < 1 or args.steps_per_epoch < 1:
+        parser.error("Epochs and steps per epoch must be positive")
+    if not np.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        parser.error("Learning rate must be finite and positive")
+    if not 0 <= args.split_seed <= 2**32 - 1 or not 0 <= args.train_seed <= 2**32 - 401:
+        parser.error("Seeds must fit NumPy's 32-bit range, including all fold offsets")
     data_name = args.dataset
     feature_set = "enhanced"
 
-    dataset_path_map = {
-        "BE3": os.path.join(BASE_DIR, "Datasets", "preprocessed", "BE3.csv"),
-        "I1":  os.path.join(BASE_DIR, "Datasets", "preprocessed", "I1.csv"),
-        "I2":  os.path.join(BASE_DIR, "Datasets", "preprocessed_conflict_excluded", "I2.csv"),
-        "II6": os.path.join(BASE_DIR, "Datasets", "preprocessed", "II6.csv"),
-        "II5": os.path.join(BASE_DIR, "Datasets", "preprocessed", "II5.csv"),
-        "K562": os.path.join(BASE_DIR, "Datasets", "preprocessed", "K562.csv"),
-        "hek": os.path.join(BASE_DIR, "Datasets", "preprocessed", "HEK293t.csv"),
-        "CHANGE-seq": os.path.join(BASE_DIR, "Datasets", "preprocessed", "CHANGE-seq.csv"),
-    }
-
-    file_path = dataset_path_map.get(data_name)
-    if file_path is None or not os.path.isfile(file_path):
-        print(f"[ERROR] Preprocessed dataset not found: {file_path}")
-        sys.exit(1)
+    dataset_root = os.path.join(BASE_DIR, training_profile["dataset_directory"])
+    file_path = os.path.abspath(args.csv or os.path.join(dataset_root, canonical_name + ".csv"))
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Preprocessed dataset not found: {file_path}")
     preprocessing_metadata_path = os.path.splitext(file_path)[0] + ".json"
     if not os.path.isfile(preprocessing_metadata_path):
         print(f"[ERROR] Preprocessing metadata not found: {preprocessing_metadata_path}")
@@ -293,8 +359,8 @@ Datasets:
 
     # Create run directory
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(BASE_DIR, "weights", f"{data_name}_E3_{feature_set}_{run_id}")
-    os.makedirs(run_dir, exist_ok=True)
+    run_dir = os.path.join(BASE_DIR, "weights", f"{data_name}_E3_{feature_set}_ensemble_{run_id}")
+    os.makedirs(run_dir, exist_ok=False)
 
     save_dir_biofusion = os.path.join(run_dir, "biofusion")
     history_dir = os.path.join(run_dir, "history")
@@ -334,8 +400,8 @@ Datasets:
     print(f"Dataset file hash: {dataset_file_hash}")
 
     # Split 15% blind test (same as P12)
-    Train_Pool_Neg, Test_Neg = train_test_split(Negative, test_size=0.15, random_state=258)
-    Train_Pool_Pos, Test_Pos = train_test_split(Positive, test_size=0.15, random_state=258)
+    Train_Pool_Neg, Test_Neg = train_test_split(Negative, test_size=0.15, random_state=args.split_seed)
+    Train_Pool_Pos, Test_Pos = train_test_split(Positive, test_size=0.15, random_state=args.split_seed)
 
     train_pool_neg_hash = get_split_hash(Train_Pool_Neg)
     test_neg_hash = get_split_hash(Test_Neg)
@@ -347,32 +413,24 @@ Datasets:
     print(f"Train pool pos hash: {train_pool_pos_hash}")
     print(f"Test pos hash: {test_pos_hash}")
 
-    # Encode test set (sequence + bio features)
+    # Keep Test raw until all folds finish and the OOF threshold is locked.
     Xtest_raw = np.vstack((Test_Neg, Test_Pos))
-    np.random.seed(42)
-    np.random.shuffle(Xtest_raw)
+    np.random.RandomState(args.split_seed).shuffle(Xtest_raw)
     test_source_ids = [int(row[3]) for row in Xtest_raw]
-
-    Xtest_df = pd.DataFrame(Xtest_raw[:, :3])
-    Xtest_enc = encoding(Xtest_df).reshape((-1, 1, 24, 7)).astype("float32")
-    Xtest_bio = extract_features_batch(Xtest_raw.tolist(), feature_set=feature_set)
-    Xtest_position = extract_position_features_batch(Xtest_raw.tolist())
-    y_test_gt = np.array([1 if float(x) > 0.0 else 0 for x in Xtest_df.iloc[:, 2]])
-
-    print(f"Test: {len(y_test_gt)} samples, {np.sum(y_test_gt)} positives\n")
-
-    BATCH_SIZE = 256
-    EPOCHS = 35
+    BATCH_SIZE = training_profile["batch_size"]
+    EPOCHS = args.epochs
     num_folds = 5
 
     train_pool = np.vstack((Train_Pool_Neg, Train_Pool_Pos))
     train_pool_y = np.array([0] * len(Train_Pool_Neg) + [1] * len(Train_Pool_Pos))
-    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=258)
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=args.split_seed)
     fold_splits = list(skf.split(train_pool, train_pool_y))
 
-    # Config - hash all three E3 files
+    # Hash the active training profile, encoder and three E3 sources.
     code_files = [
         __file__,
+        training_profile_path,
+        Encoder_sgRNA_off.__file__,
         os.path.join(CURRENT_DIR, "biological_features.py"),
         os.path.join(BASE_DIR, "Train", "MODEL_E3_BioFusion.py")
     ]
@@ -419,18 +477,35 @@ Datasets:
         'test_size': 0.15,
         'num_folds': num_folds,
         'batch_size': BATCH_SIZE,
-        'steps_per_epoch': 250,
+        'steps_per_epoch': args.steps_per_epoch,
         'epochs': EPOCHS,
         'model': f'P12_BioFusion_{feature_set}',
         'architecture_ablation': 'use raw 21-channel position input before BiGRU-2; Flatten classifier path; bio_gate uses the Keras default zero initializer',
         'bio_gate_bias_initializer': 'zeros (Keras default)',
         'loss': 'WeightedBCEDiceLoss_alpha0.7_beta2.0',
-        'optimizer': 'Adam_1e-4',
+        'optimizer': f'Adam_{args.learning_rate}',
+        'learning_rate': args.learning_rate,
+        'gradient_clipping': None,
+        'validation_batch_size': validation_batch_size,
+        'validation_shuffle': False,
         'generator': 'BioFusionGenerator_64pos_16hard_176norm',
         'checkpoint_rule': 'val_loss_min',
-        'threshold_rule': 'F1_optimal_cumulative',
-        'bio_hard_rule': 'protospacer_mismatch_le_3; quota 16 per batch',
-        'steps_policy': 'fixed 250 steps per epoch',
+        'threshold_rule': 'max F1 on pooled out-of-fold Validation probabilities; ties: lowest threshold',
+        'fold_validation_threshold_rule': 'F1_optimal_cumulative',
+        'learning_rate_monitor': 'val_loss_min',
+        'split_seed': args.split_seed,
+        'train_seed_base': args.train_seed,
+        'split_protocol': training_profile['split_protocol'],
+        'training_profile_file': os.path.abspath(training_profile_path),
+        'training_profile_hash': compute_file_hash(training_profile_path),
+        'reference_run': 'K562_E3_enhanced_20261030_213631',
+        'evaluation_protocol': '85% development, five independent stratified folds; Test inference only after CV and threshold locking',
+        'ensemble_rule': 'equal-weight arithmetic mean of five best-checkpoint positive probabilities, each using its own train-fitted scaler',
+        'fold_seed_policy': 'train_seed_base + zero_based_fold_index * 100',
+        'threshold_transfer': 'pooled OOF single-model scores estimate a threshold for the ensemble; score calibration may differ',
+        'status': 'cross_validation',
+        'bio_hard_rule': 'legacy first 20 sequence columns, mismatches <= 3; quota 16 per batch',
+        'steps_policy': 'fixed within run; reference default 250 steps per epoch',
         'feature_policy': 'single unified enhanced feature set; legacy names resolve to this same set for caller compatibility',
         'pam_policy': 'paper section 4.1: NGG PAM; encode only the terminal variable N base (4 features), omit invariant GG',
         'mismatch_policy': 'adds positions 1-3 and 17-19, transition/transversion counts, and maximum consecutive mismatch run',
@@ -440,7 +515,8 @@ Datasets:
         'keras_version': keras_version,
         'code_hash': code_hash,
         'fold_seeds': {},
-        'init_hashes': {}
+        'init_hashes': {},
+        'best_selections': {}
     }
 
     with open(os.path.join(run_dir, "config.json"), 'w') as f:
@@ -448,6 +524,8 @@ Datasets:
 
     # Results storage
     results_biofusion = []
+    oof_frames = []
+    fold_artifacts = []
 
     start_time = datetime.now()
 
@@ -455,7 +533,7 @@ Datasets:
     # 5-FOLD TRAINING
     # =========================================================================
     for fold in range(num_folds):
-        fold_seed = 42 + fold * 100
+        fold_seed = args.train_seed + fold * 100
         config['fold_seeds'][f'fold_{fold+1}'] = fold_seed
 
         print(f"\n{'='*70}")
@@ -470,7 +548,7 @@ Datasets:
 
         Train_Neg = Train_raw[Train_y == 0]
         Train_Pos = Train_raw[Train_y == 1]
-        steps_per_epoch = 250
+        steps_per_epoch = args.steps_per_epoch
 
         print(
             f"Train: {len(Train_Pos)} Pos | {len(Train_Neg)} Neg | "
@@ -503,13 +581,13 @@ Datasets:
         Train_all_bio = np.vstack([Train_Pos_bio, Neg_Bio_bio if len(Neg_Bio_bio) > 0 else Train_Pos_bio[:0], Neg_Normal_bio])
         scaler.fit(Train_all_bio)
 
-        # Transform all splits
+        # Transform Train and Validation with this fold's Train-fitted scaler.
         Train_Pos_bio = scaler.transform(Train_Pos_bio)
         if len(Neg_Bio_bio) > 0:
             Neg_Bio_bio = scaler.transform(Neg_Bio_bio)
-        Neg_Normal_bio = scaler.transform(Neg_Normal_bio)
+        if len(Neg_Normal_bio) > 0:
+            Neg_Normal_bio = scaler.transform(Neg_Normal_bio)
         Xval_bio = scaler.transform(Xval_bio_raw)
-        Xtest_bio_fold = scaler.transform(Xtest_bio)
 
         # Save feature stats
         feature_stats = {
@@ -529,7 +607,7 @@ Datasets:
         model_biofusion = Crispr_SGRU_BioFusion(
             bio_feature_dim=feature_dim,
             position_feature_dim=21,
-            learning_rate=0.0001
+            learning_rate=args.learning_rate
         )
         init_hash_biofusion = get_model_weights_hash(model_biofusion)
         biofusion_param_count = model_biofusion.count_params()
@@ -564,6 +642,7 @@ Datasets:
         history_biofusion = model_biofusion.fit(
             gen_biofusion.flow(),
             validation_data=((Xval_enc, Xval_bio, Xval_position), y_val_target),
+            validation_batch_size=validation_batch_size,
             epochs=EPOCHS,
             steps_per_epoch=steps_per_epoch,
             callbacks=callbacks_biofusion,
@@ -587,44 +666,8 @@ Datasets:
         val_output_biofusion = model_biofusion.predict((Xval_enc, Xval_bio, Xval_position), verbose=0)
         val_probs_biofusion = positive_probability(val_output_biofusion)
         thresh_biofusion, _ = find_optimal_f1_threshold(y_val_gt, val_probs_biofusion)
-        val_pred_biofusion = (val_probs_biofusion >= thresh_biofusion).astype(int)
-
-        # Validation metrics only if both classes present
-        val_metrics_biofusion = {}
-        if len(np.unique(y_val_gt)) == 2:
-            fpr, tpr, _ = roc_curve(y_val_gt, val_probs_biofusion)
-            val_metrics_biofusion['AUROC'] = auc(fpr, tpr)
-            p_curve, r_curve, _ = precision_recall_curve(y_val_gt, val_probs_biofusion)
-            val_metrics_biofusion['PRAUC'] = auc(r_curve, p_curve)
-        else:
-            val_metrics_biofusion['AUROC'] = np.nan
-            val_metrics_biofusion['PRAUC'] = np.nan
-        val_metrics_biofusion['F1'] = f1_score(y_val_gt, val_pred_biofusion, zero_division=0)
-        val_metrics_biofusion['Precision'] = precision_score(y_val_gt, val_pred_biofusion, zero_division=0)
-        val_metrics_biofusion['Recall'] = recall_score(y_val_gt, val_pred_biofusion, zero_division=0)
-        val_metrics_biofusion['MCC'] = matthews_corrcoef(y_val_gt, val_pred_biofusion)
-
-        # Test metrics use the threshold selected on validation only.
-        test_output_biofusion = model_biofusion.predict((Xtest_enc, Xtest_bio_fold, Xtest_position), verbose=0)
-        test_probs_biofusion = positive_probability(test_output_biofusion)
-        test_pred_biofusion = (test_probs_biofusion >= thresh_biofusion).astype(int)
-
-        test_metrics_biofusion = {}
-        if len(np.unique(y_test_gt)) == 2:
-            fpr, tpr, _ = roc_curve(y_test_gt, test_probs_biofusion)
-            test_metrics_biofusion['AUROC'] = auc(fpr, tpr)
-            p_curve, r_curve, _ = precision_recall_curve(y_test_gt, test_probs_biofusion)
-            test_metrics_biofusion['PRAUC'] = auc(r_curve, p_curve)
-        else:
-            test_metrics_biofusion['AUROC'] = np.nan
-            test_metrics_biofusion['PRAUC'] = np.nan
-        test_metrics_biofusion['F1'] = f1_score(y_test_gt, test_pred_biofusion, zero_division=0)
-        test_metrics_biofusion['Precision'] = precision_score(y_test_gt, test_pred_biofusion, zero_division=0)
-        test_metrics_biofusion['Recall'] = recall_score(y_test_gt, test_pred_biofusion, zero_division=0)
-        test_metrics_biofusion['MCC'] = matthews_corrcoef(y_test_gt, test_pred_biofusion)
-
-        print(f"BioFusion (Validation): AUROC={val_metrics_biofusion['AUROC']:.4f}, PRAUC={val_metrics_biofusion['PRAUC']:.4f}, F1={val_metrics_biofusion['F1']:.4f}, Prec={val_metrics_biofusion['Precision']:.4f}, Rec={val_metrics_biofusion['Recall']:.4f}, MCC={val_metrics_biofusion['MCC']:.4f} (thresh={thresh_biofusion:.4f})")
-        print(f"BioFusion (Test):       AUROC={test_metrics_biofusion['AUROC']:.4f}, PRAUC={test_metrics_biofusion['PRAUC']:.4f}, F1={test_metrics_biofusion['F1']:.4f}, Prec={test_metrics_biofusion['Precision']:.4f}, Rec={test_metrics_biofusion['Recall']:.4f}, MCC={test_metrics_biofusion['MCC']:.4f}")
+        val_metrics_biofusion = compute_metrics(y_val_gt, val_probs_biofusion, thresh_biofusion)
+        print(f"BioFusion (Validation): {val_metrics_biofusion} (threshold={thresh_biofusion:.6f})")
 
         results_biofusion.append({
             'Fold': f'Fold_{fold+1}',
@@ -639,34 +682,29 @@ Datasets:
             'MCC': val_metrics_biofusion['MCC']
         })
 
-        results_biofusion.append({
-            'Fold': f'Fold_{fold+1}',
-            'split': 'test',
-            'Best_Epoch': best_epoch_biofusion,
-            'Threshold': thresh_biofusion,
-            'AUROC': test_metrics_biofusion['AUROC'],
-            'PRAUC': test_metrics_biofusion['PRAUC'],
-            'F1': test_metrics_biofusion['F1'],
-            'Precision': test_metrics_biofusion['Precision'],
-            'Recall': test_metrics_biofusion['Recall'],
-            'MCC': test_metrics_biofusion['MCC']
-        })
-
-        # Save predictions
-        pd.DataFrame({
+        fold_oof = pd.DataFrame({
             'source_id': val_source_ids,
+            'fold': fold + 1,
             'y_true': y_val_gt,
-            'y_prob': val_probs_biofusion
-        }).to_csv(os.path.join(predictions_dir, f"fold{fold+1}_biofusion_val.csv"), index=False)
-
-        pd.DataFrame({
-            'source_id': test_source_ids,
-            'y_true': y_test_gt,
-            'y_prob': test_probs_biofusion,
-            'y_pred': test_pred_biofusion
-        }).to_csv(os.path.join(predictions_dir, f"fold{fold+1}_biofusion_test.csv"), index=False)
-
-        del model_biofusion
+            'y_prob': val_probs_biofusion,
+        })
+        fold_oof.to_csv(os.path.join(predictions_dir, f"fold{fold+1}_biofusion_val.csv"), index=False)
+        oof_frames.append(fold_oof)
+        fold_artifacts.append({
+            'weights_path': weight_path_biofusion,
+            'scaler_path': os.path.join(features_dir, f"fold{fold+1}_feature_stats.json"),
+        })
+        config['best_selections'][f'fold_{fold+1}'] = {
+            'epoch': best_epoch_biofusion,
+            'val_loss': float(history_biofusion.history['val_loss'][best_epoch_biofusion - 1]),
+            'validation_threshold': float(thresh_biofusion),
+        }
+        # Release callback/generator references before constructing the next fold.
+        del model_biofusion, gen_biofusion, callbacks_biofusion, history_biofusion
+        del Train_Pos_enc, Neg_Bio_enc, Neg_Normal_enc, Xval_enc
+        del Train_Pos_bio, Neg_Bio_bio, Neg_Normal_bio, Xval_bio, Xval_bio_raw, Train_all_bio
+        del Train_Pos_position, Neg_Bio_position, Neg_Normal_position, Xval_position
+        del val_output_biofusion, val_probs_biofusion, scaler
         K.clear_session()
         gc.collect()
 
@@ -674,51 +712,71 @@ Datasets:
         with open(os.path.join(run_dir, "config.json"), 'w') as f:
             json.dump(config, f, indent=2)
 
-    print(f"\n{'='*70}")
-    print("BIOFUSION MEAN ± STD (VALIDATION AND TEST)")
-    print(f"{'='*70}\n")
+    # Lock the threshold using exactly one held-out prediction per pool row.
+    oof = pd.concat(oof_frames, ignore_index=True).sort_values('source_id').reset_index(drop=True)
+    expected_ids = np.asarray([int(row[3]) for row in train_pool])
+    if oof['source_id'].duplicated().any() or not np.array_equal(
+            oof['source_id'].to_numpy(), np.sort(expected_ids)):
+        raise RuntimeError("OOF predictions must cover every development row exactly once")
+    if np.intersect1d(expected_ids, test_source_ids).size:
+        raise RuntimeError("Development and Test source rows overlap")
+    ensemble_threshold, oof_f1 = find_optimal_f1_threshold(
+        oof['y_true'].to_numpy(), oof['y_prob'].to_numpy(),
+    )
+    config['ensemble_threshold'] = float(ensemble_threshold)
+    config['oof_threshold_f1'] = float(oof_f1)
+    config['oof_rows'] = len(oof)
+    config['status'] = 'threshold_locked_before_test'
+    with open(os.path.join(run_dir, "config.json"), 'w') as f:
+        json.dump(config, f, indent=2)
+    oof.to_csv(os.path.join(predictions_dir, "biofusion_oof_val.csv"), index=False)
+
+    # First Test feature extraction/inference: all CV decisions are now locked.
+    print(f"\nCV complete. Locked OOF F1 threshold: {ensemble_threshold:.6f}")
+    print("Evaluating the five-checkpoint probability ensemble on Test...")
+    Xtest_df = pd.DataFrame(Xtest_raw[:, :3])
+    Xtest_enc = encoding(Xtest_df).reshape((-1, 1, 24, 7)).astype("float32")
+    Xtest_bio = extract_features_batch(Xtest_raw.tolist(), feature_set=feature_set)
+    Xtest_position = extract_position_features_batch(Xtest_raw.tolist())
+    test_probs = predict_ensemble(
+        fold_artifacts, Xtest_enc, Xtest_bio, Xtest_position, args.learning_rate,
+    )
+    y_test_gt = np.array([1 if float(x) > 0.0 else 0 for x in Xtest_df.iloc[:, 2]])
+    test_metrics = compute_metrics(y_test_gt, test_probs, ensemble_threshold)
+    test_pred = (test_probs >= ensemble_threshold).astype(int)
+    pd.DataFrame({
+        'source_id': test_source_ids,
+        'y_true': y_test_gt,
+        'y_prob': test_probs,
+        'y_pred': test_pred,
+    }).to_csv(os.path.join(predictions_dir, "ensemble_biofusion_test.csv"), index=False)
 
     df_biofusion = pd.DataFrame(results_biofusion)
     metrics_cols = ['Best_Epoch', 'Threshold', 'AUROC', 'PRAUC', 'F1', 'Precision', 'Recall', 'MCC']
-    expected_folds = [f'Fold_{i + 1}' for i in range(num_folds)]
     summary_rows = []
-    for split_name in ('val', 'test'):
-        split_df = df_biofusion[df_biofusion['split'] == split_name].copy()
-        if set(split_df['Fold']) != set(expected_folds) or len(split_df) != num_folds:
-            raise RuntimeError(
-                f"Expected exactly {num_folds} BioFusion {split_name} fold rows; "
-                f"got {len(split_df)}"
-            )
-        split_df = split_df.set_index('Fold').loc[expected_folds].reset_index()
-        mean_row = {'Fold': 'Mean', 'split': split_name}
-        std_row = {'Fold': 'Std', 'split': split_name}
+    for stat in ('Mean', 'Std'):
+        row = {'Fold': stat, 'split': 'val'}
         for metric in metrics_cols:
-            mean_row[metric] = split_df[metric].mean()
-            std_row[metric] = split_df[metric].std(ddof=0)
-        summary_rows.extend([mean_row, std_row])
-
-    df_biofusion = pd.concat([df_biofusion, pd.DataFrame(summary_rows)], ignore_index=True)
-    per_fold_csv = os.path.join(run_dir, "E3_biofusion_per_fold.csv")
-    summary_csv = os.path.join(run_dir, "E3_biofusion_summary.csv")
-    df_biofusion.to_csv(per_fold_csv, index=False)
-    pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
-    print(df_biofusion.to_string(index=False))
-    print(f"\nSaved: {per_fold_csv}")
-    print(f"Saved: {summary_csv}")
-
-    # Final config save
+            row[metric] = (df_biofusion[metric].mean() if stat == 'Mean'
+                           else df_biofusion[metric].std(ddof=0))
+        summary_rows.append(row)
+    summary_rows.append({
+        'Fold': 'Ensemble_5', 'split': 'test', 'Best_Epoch': np.nan,
+        'Threshold': ensemble_threshold, **test_metrics,
+    })
+    df_biofusion.to_csv(os.path.join(run_dir, "E3_biofusion_per_fold.csv"), index=False)
+    pd.DataFrame(summary_rows).to_csv(os.path.join(run_dir, "E3_biofusion_summary.csv"), index=False)
+    config['status'] = 'complete'
+    config['test_metrics'] = test_metrics
+    config['ensemble_checkpoints'] = [os.path.relpath(item['weights_path'], run_dir) for item in fold_artifacts]
+    config['ensemble_scalers'] = [os.path.relpath(item['scaler_path'], run_dir) for item in fold_artifacts]
     with open(os.path.join(run_dir, "config.json"), 'w') as f:
         json.dump(config, f, indent=2)
+    print("\nValidation CV mean/std and ONE final Test ensemble result:")
+    print(pd.DataFrame(summary_rows).to_string(index=False))
+    print(f"\nSaved: {run_dir}")
+    print(f"Total time: {datetime.now() - start_time}")
 
-    print(f"\n{'='*70}")
-    print("E3 COMPLETE")
-    print(f"{'='*70}")
-    print(f"\nPRIMARY RESULT = BioFusion mean ± std across 5 validation folds")
-    print(f"  Decision rule: positive class score > negative class score")
-    print(f"\nAll results include both validation and test splits:")
-    print(f"  - Validation: ranking and class-decision evaluation")
-    print(f"  - Test: final evaluation with the locked MODEL.py decision rule")
-    print(f"\nFeature set: {feature_set.upper()} ({feature_dim} features)")
-    print(f"Feature stats saved per fold in {features_dir}")
-    print(f"Predictions saved in {predictions_dir}")
-    print(f"\nTotal time: {datetime.now() - start_time}")
+
+if __name__ == "__main__":
+    main()

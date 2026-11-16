@@ -1,0 +1,31 @@
+{
+  "reference_run": "K562_E3_enhanced_20261030_213631",
+  "dataset_directory": "Datasets/preprocessed_conflict",
+  "split_protocol": "classwise_holdout_stratified_fivefold",
+  "split_seed": 42,
+  "train_seed": 42,
+  "fold_seed_policy": "train_seed + zero_based_fold * 100",
+  "epochs": 35,
+  "batch_size": 256,
+  "learning_rate": 0.0001,
+  "hard_negative_per_batch": 16,
+  "hard_negative_mode": "static",
+  "steps_per_epoch": {
+    "K562": 250,
+    "HEK293t": 250,
+    "II5": 250,
+    "II6": 250,
+    "I1": 250,
+    "I2": 250,
+    "BE3": 250,
+    "CHANGE-seq": 250
+  },
+  "selection_rule": "val_loss_f1",
+  "checkpoint_rule": "val_loss_min",
+  "learning_rate_monitor": "val_loss",
+  "validation_batch_size": 32,
+  "validation_shuffle": false,
+  "threshold_rule": "max F1 on pooled out-of-fold Validation probabilities; ties: lowest threshold",
+  "ensemble_rule": "equal-weight average of all five best-checkpoint probabilities; own Train scaler per checkpoint",
+  "test_evaluation": "after all five folds and OOF threshold locking; one ensemble result"
+}
