@@ -141,6 +141,9 @@ def Crispr_SGRU_BioFusion(
     position_feature_dim=21,
     learning_rate=0.0001,
     bio_gate_bias_initializer=0.0,
+    dropout_rate=0.35,
+    bce_weight=0.5,
+    dice_weight=0.5,
 ):
     """
     MODEL12 + Biological Feature Fusion.
@@ -213,7 +216,7 @@ def Crispr_SGRU_BioFusion(
     bio_delta = layers.Dense(64, activation='tanh', name='bio_delta')(bio_repr)
     gated_delta = layers.Multiply(name='gated_bio_delta')([bio_gate, bio_delta])
     fusion_repr = layers.Add(name='residual_fusion')([seq_repr, gated_delta])
-    fusion_repr = layers.Dropout(0.35, name='fusion_dropout')(fusion_repr)
+    fusion_repr = layers.Dropout(dropout_rate, name='fusion_dropout')(fusion_repr)
 
     # Output
     probs = layers.Dense(1, activation='sigmoid', name='prob_output')(fusion_repr)
@@ -226,8 +229,8 @@ def Crispr_SGRU_BioFusion(
 
     opt = Adam(learning_rate=learning_rate)
     loss_fn = BCEDiceLoss(
-        bce_weight=0.5,
-        dice_weight=0.5,
+        bce_weight=bce_weight,
+        dice_weight=dice_weight,
         alpha=0.7,
         beta=2.0,
         from_logits=False,
