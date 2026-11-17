@@ -1,7 +1,8 @@
-"""E3 BioFusion with the K562 20261030_213631 training configuration.
+"""E3 BioFusion with the K562 ensemble 20261116_013617 configuration.
 
-Five independent folds on the 85% development pool select checkpoints by
-minimum val_loss. Pool their held-out Validation predictions to lock one
+Hold out 15% per class, then train five independent stratified folds on the
+85% development pool. Checkpoints minimize val_loss. Pool the
+held-out Validation predictions to lock one
 max-F1 threshold, then average the five checkpoint probabilities on the shared
 15% Test. No Test inference or Test metrics run during cross-validation.
 """
@@ -19,12 +20,12 @@ import argparse
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import (
     roc_curve, precision_recall_curve, auc,
     matthews_corrcoef, precision_score, recall_score, f1_score
 )
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 import tensorflow as tf
 from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint
@@ -67,21 +68,22 @@ from MODEL_E3_BioFusion import Crispr_SGRU_BioFusion
 
 
 def load_data(file_path):
-    """Load data with source row IDs."""
+    """Load binary preprocessed rows without skipping or reordering observations."""
     Negative, Positive = [], []
-    with open(file_path, 'r') as f:
+    all_rows = []
+    with open(file_path, 'r', encoding='utf-8') as f:
         for row_id, line in enumerate(f):
             ll = line.strip().split(',')
-            try:
-                label_item = np.float64(ll[2])
-            except (ValueError, IndexError):
-                continue
+            if len(ll) != 3 or ll[2] not in ('0', '1'):
+                raise ValueError(f"Invalid preprocessed row {row_id + 1}: expected three columns and label 0/1")
+            label_item = int(ll[2])
             row_with_id = (ll[0], ll[1], ll[2], row_id)
+            all_rows.append(row_with_id)
             if label_item == 0.0:
                 Negative.append(row_with_id)
             else:
                 Positive.append(row_with_id)
-    return Negative, Positive
+    return Negative, Positive, all_rows
 
 
 def encoding(data):
@@ -290,7 +292,7 @@ def main(argv=None):
     if training_profile["selection_rule"] != "val_loss_f1":
         raise ValueError("Reference training profile must use val_loss_f1")
     if training_profile["split_protocol"] != "classwise_holdout_stratified_fivefold":
-        raise ValueError("Reference training profile must use the original row-level split")
+        raise ValueError("Reference profile must use classwise holdout and stratified five-fold CV")
     if (training_profile["hard_negative_mode"] != "static"
             or training_profile["hard_negative_per_batch"] != 16):
         raise ValueError("Reference sampler requires static hard negatives with quota 16")
@@ -387,7 +389,7 @@ Datasets:
     print(f"Feature names: {feature_names[:5]} ... ({len(feature_names)} total)\n")
 
     # Load data
-    Negative, Positive = load_data(file_path)
+    Negative, Positive, all_rows_list = load_data(file_path)
     sequence_column_order = "preprocessed_column_0_sgrna_column_1_offtarget"
     Negative = np.array(Negative, dtype=object)
     Positive = np.array(Positive, dtype=object)
@@ -399,9 +401,17 @@ Datasets:
     print(f"Data: {total_pos} Pos | {total_neg} Neg")
     print(f"Dataset file hash: {dataset_file_hash}")
 
-    # Split 15% blind test (same as P12)
-    Train_Pool_Neg, Test_Neg = train_test_split(Negative, test_size=0.15, random_state=args.split_seed)
-    Train_Pool_Pos, Test_Pos = train_test_split(Positive, test_size=0.15, random_state=args.split_seed)
+    # Match the reference: split each class separately, preserving sklearn's
+    # returned order before constructing the development pool (negative first).
+    Train_Pool_Neg, Test_Neg = train_test_split(
+        Negative, test_size=0.15, random_state=args.split_seed,
+    )
+    Train_Pool_Pos, Test_Pos = train_test_split(
+        Positive, test_size=0.15, random_state=args.split_seed,
+    )
+    Train_Pool = np.vstack((Train_Pool_Neg, Train_Pool_Pos))
+    train_pool_y = np.array([0] * len(Train_Pool_Neg) + [1] * len(Train_Pool_Pos))
+    Test_raw = np.vstack((Test_Neg, Test_Pos))
 
     train_pool_neg_hash = get_split_hash(Train_Pool_Neg)
     test_neg_hash = get_split_hash(Test_Neg)
@@ -414,17 +424,17 @@ Datasets:
     print(f"Test pos hash: {test_pos_hash}")
 
     # Keep Test raw until all folds finish and the OOF threshold is locked.
-    Xtest_raw = np.vstack((Test_Neg, Test_Pos))
+    Xtest_raw = Test_raw.copy()
     np.random.RandomState(args.split_seed).shuffle(Xtest_raw)
     test_source_ids = [int(row[3]) for row in Xtest_raw]
     BATCH_SIZE = training_profile["batch_size"]
     EPOCHS = args.epochs
     num_folds = 5
 
-    train_pool = np.vstack((Train_Pool_Neg, Train_Pool_Pos))
-    train_pool_y = np.array([0] * len(Train_Pool_Neg) + [1] * len(Train_Pool_Pos))
+    if min(len(Train_Pool_Neg), len(Train_Pool_Pos)) < num_folds:
+        raise ValueError("Development pool needs at least five observations per class")
     skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=args.split_seed)
-    fold_splits = list(skf.split(train_pool, train_pool_y))
+    fold_splits = list(skf.split(Train_Pool, train_pool_y))
 
     # Hash the active training profile, encoder and three E3 sources.
     code_files = [
@@ -460,6 +470,7 @@ Datasets:
         'test_neg_hash': test_neg_hash,
         'train_pool_pos_hash': train_pool_pos_hash,
         'test_pos_hash': test_pos_hash,
+        'oof_coverage_policy': 'exactly once per development-pool row; shared Test rows excluded',
         'feature_set': 'enhanced',
         'feature_dim': feature_dim,
         'feature_names': feature_names,
@@ -475,6 +486,7 @@ Datasets:
         'total_pos': total_pos,
         'total_neg': total_neg,
         'test_size': 0.15,
+        'actual_test_fraction': len(Test_raw) / (total_pos + total_neg),
         'num_folds': num_folds,
         'batch_size': BATCH_SIZE,
         'steps_per_epoch': args.steps_per_epoch,
@@ -486,6 +498,7 @@ Datasets:
         'optimizer': f'Adam_{args.learning_rate}',
         'learning_rate': args.learning_rate,
         'gradient_clipping': None,
+        'bio_scaling_policy': 'StandardScaler fit on train fold; no biological feature clipping',
         'validation_batch_size': validation_batch_size,
         'validation_shuffle': False,
         'generator': 'BioFusionGenerator_64pos_16hard_176norm',
@@ -498,7 +511,7 @@ Datasets:
         'split_protocol': training_profile['split_protocol'],
         'training_profile_file': os.path.abspath(training_profile_path),
         'training_profile_hash': compute_file_hash(training_profile_path),
-        'reference_run': 'K562_E3_enhanced_20261030_213631',
+        'reference_run': training_profile['reference_run'],
         'evaluation_protocol': '85% development, five independent stratified folds; Test inference only after CV and threshold locking',
         'ensemble_rule': 'equal-weight arithmetic mean of five best-checkpoint positive probabilities, each using its own train-fitted scaler',
         'fold_seed_policy': 'train_seed_base + zero_based_fold_index * 100',
@@ -541,8 +554,9 @@ Datasets:
         print(f"{'='*70}")
 
         train_idx, val_idx = fold_splits[fold]
-        Train_raw, Val_raw = train_pool[train_idx], train_pool[val_idx]
-        Train_y, Val_y = train_pool_y[train_idx], train_pool_y[val_idx]
+        Train_raw, Val_raw = Train_Pool[train_idx], Train_Pool[val_idx]
+        Train_y = train_pool_y[train_idx]
+        Val_y = train_pool_y[val_idx]
 
         val_source_ids = [int(row[3]) for row in Val_raw]
 
@@ -581,7 +595,7 @@ Datasets:
         Train_all_bio = np.vstack([Train_Pos_bio, Neg_Bio_bio if len(Neg_Bio_bio) > 0 else Train_Pos_bio[:0], Neg_Normal_bio])
         scaler.fit(Train_all_bio)
 
-        # Transform Train and Validation with this fold's Train-fitted scaler.
+        # Standardize with Train statistics only, as in the reference configuration.
         Train_Pos_bio = scaler.transform(Train_Pos_bio)
         if len(Neg_Bio_bio) > 0:
             Neg_Bio_bio = scaler.transform(Neg_Bio_bio)
@@ -712,12 +726,12 @@ Datasets:
         with open(os.path.join(run_dir, "config.json"), 'w') as f:
             json.dump(config, f, indent=2)
 
-    # Lock the threshold using exactly one held-out prediction per pool row.
+    # Every development row is held out for Validation exactly once.
     oof = pd.concat(oof_frames, ignore_index=True).sort_values('source_id').reset_index(drop=True)
-    expected_ids = np.asarray([int(row[3]) for row in train_pool])
+    expected_ids = Train_Pool[:, 3].astype(np.int64)
     if oof['source_id'].duplicated().any() or not np.array_equal(
             oof['source_id'].to_numpy(), np.sort(expected_ids)):
-        raise RuntimeError("OOF predictions must cover every development row exactly once")
+        raise RuntimeError("OOF predictions must cover every development-pool row exactly once")
     if np.intersect1d(expected_ids, test_source_ids).size:
         raise RuntimeError("Development and Test source rows overlap")
     ensemble_threshold, oof_f1 = find_optimal_f1_threshold(

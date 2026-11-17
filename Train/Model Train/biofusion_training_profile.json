@@ -1,5 +1,5 @@
 {
-  "reference_run": "K562_E3_enhanced_20261030_213631",
+  "reference_run": "K562_E3_enhanced_ensemble_20261116_013617",
   "dataset_directory": "Datasets/preprocessed_conflict",
   "split_protocol": "classwise_holdout_stratified_fivefold",
   "split_seed": 42,
